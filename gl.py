@@ -1,84 +1,22 @@
-import struct
-import random
-from obj import Obj
+from shaders import *
+from mymath import *
+from math import pi, sin, cos, tan
+from obj import Obj, texture
 from collections import namedtuple
 
-#math utils
 
-V2 = namedtuple('Point2', ['x', 'y'])
-V3 = namedtuple('Point3', ['x', 'y', 'z'])
 
-def sum(v0, v1):
-  return V3(v0.x + v1.x, v0.y + v1.y, v0.z + v1.z)
 
-def sub(v0, v1):
-  return V3(v0.x - v1.x, v0.y - v1.y, v0.z - v1.z)
 
-def mul(v0, k):
-  return V3(v0.x * k, v0.y * k, v0.z *k)
-
-def dot(v0, v1):
-  return v0.x * v1.x + v0.y * v1.y + v0.z * v1.z
-
-def cross(v0, v1):
-  return V3(
-    v0.y * v1.z - v0.z * v1.y,
-    v0.z * v1.x - v0.x * v1.z,
-    v0.x * v1.y - v0.y * v1.x,
-  )
-
-def length(v0):
-  return (v0.x**2 + v0.y**2 + v0.z**2)**0.5
-
-def norm(v0):
-  v0length = length(v0)
-
-  if not v0length:
-    return V3(0, 0, 0)
-
-  return V3(v0.x/v0length, v0.y/v0length, v0.z/v0length)
-
-def bbox(*vertices):
-  xs = [ vertex.x for vertex in vertices ]
-  ys = [ vertex.y for vertex in vertices ]
-  xs.sort()
-  ys.sort()
-
-  return V2(xs[0], ys[0]), V2(xs[-1], ys[-1])
-
-def barycentric(A, B, C, P):
-  
-  bary = cross(
-    V3(C.x - A.x, B.x - A.x, A.x - P.x), 
-    V3(C.y - A.y, B.y - A.y, A.y - P.y)
-  )
-
-  if abs(bary[2]) < 1:
-    return -1, -1, -1   
-
-  return (
-    1 - (bary[0] + bary[1]) / bary[2], 
-    bary[1] / bary[2], 
-    bary[0] / bary[2]
-  )
-
-#bmp utils
-
-def char(c):
-    return struct.pack('=c', c.encode('ascii'))
-
-def word(c):
-    return struct.pack('=h', c)
-
-def dword(c):
-    return struct.pack('=l', c)
-
-def color(r, g, b):
-    return bytes([b,g,r])
-
-#My Renderer
+#Renderer
 
 class Render(object):
+
+    activeTexture = None
+    light = V3(0, 0, 0)
+    cameraMatrix = []
+    viewMatrix = []
+
     def __init__(self):
         self.clear_color = color(0,0,0)
         self.draw_color = color(255,255,233)
@@ -89,14 +27,15 @@ class Render(object):
             for y in range(self.height)
         ]
         self.zbuffer = [
-            [-float('inf') for x in range(self.width)]
+            [float('inf') for x in range(self.width)]
             for y in range(self.height)
         ]
 
-    def glCreateWindow(self, width, height): #el width y height del window es el del Render()
+    def glCreateWindow(self, width, height): #width and height from window are renderer
         self.width = width
         self.height = height
         self.framebuffer = []
+        self.glViewPort(0, 0, width, height)
         self.glClear()
     
     def point(self, x,y, color=None):
@@ -110,6 +49,12 @@ class Render(object):
         self.y_VP = y
         self.width_VP = width
         self.height_VP = height
+
+        self.viewPortMatrix = [[width/2, 0, 0, x+width/2],
+                                [0, height/2, 0, y+height/2],
+                                [0, 0, 0.5, 0.5],
+                                [0, 0, 0, 1],]
+        self.createProjectionMatrix()
 
     def glClearColor(self, r, g, b):
         self.clear_color = color(int(round(r*255)),int(round(g*255)),int(round(b*255)))
@@ -151,54 +96,130 @@ class Render(object):
                 self.framebuffer[y][x] = self.draw_color
             offset += 2*dy
 
-    def load(self, filename, translate=(0, 0, 0), scale=(1, 1, 1)):
-        model = Obj(filename)
+    def createProjectionMatrix(self, n = 0.1, f = 1000, fov = 60):
+        t = tan((fov * pi/180)/2)*n
+        r = t * self.width_VP/self.height_VP
 
-        light = V3(0,0,1)
+        self.projectionMatrix = [[n/r, 0, 0, 0],
+                                [0, n/t, 0, 0],
+                                [0, 0, -(f+n)/(f-n), -(2*f*n)/(f-n)],
+                                [0, 0, -1, 0]]
+
+    def triangle(self, A, B, C, texcoords, normals, vertices):
+        bmin, b_max = bbox(A, B, C)
+
+        for x in range(int(bmin.x), int(b_max.x) + 1):
+            if x >= self.width:
+                continue
+            for y in range(int(bmin.y), int(b_max.y) + 1):
+                if y >= self.height:
+                    continue
+                u, v, w = bcenntric(A, B, C, V2(x, y))
+                if w < 0 or v < 0 or u < 0:  
+                    continue
+                
+                z = A.z * u + B.z * v + C.z * w
+                
+                if z < self.zbuffer[x][y] and -1 < z < 1:
+                    
+                    color = self.shader(self,
+                    vertices = vertices, 
+                    texcoords = texcoords, 
+                    normals = normals, 
+                    texture = self.activeTexture,
+                    barycoords = (u, v, w))
+
+                    self.point(x, y, color)
+                    self.zbuffer[x][y] = z
+
+    def load(self, filename, translate=V3(0, 0, 0), scale=V3(1, 1, 1), rotate = V3(0, 0, 0)):
+        model = Obj(filename)
+        objectMatrix = self.getObjectMatrix(translate, scale, rotate)
+        rotationMatrix = self.getRotationMatrix(rotate)
+        vertices = []
+        texcoords = []
+        normals = []
 
         for face in model.vfaces:
             vcount = len(face)
 
             if vcount == 3:
-                f1 = face[0][0] - 1
-                f2 = face[1][0] - 1
-                f3 = face[2][0] - 1
+                f1 =  face[0][0] - 1
+                f2 =  face[1][0] - 1
+                f3 =  face[2][0] - 1
 
-                a = self.transform(model.vertices[f1], translate, scale)
-                b = self.transform(model.vertices[f2], translate, scale)
-                c = self.transform(model.vertices[f3], translate, scale)
+                vt1 =  face[0][1] - 1
+                vt2 =  face[1][1] - 1
+                vt3 =  face[2][1] - 1
 
-                normal = norm(cross(sub(b, a), sub(c, a)))
-                intensity = dot(normal, light)
-                grey = round(255 * intensity)
-                if grey < 0:
-                    continue  
-            
-                self.triangle(a, b, c, color(grey, grey, grey))
-            else:
-                # assuming 4
-                f1 = face[0][0] - 1
-                f2 = face[1][0] - 1
-                f3 = face[2][0] - 1
-                f4 = face[3][0] - 1   
+                vn1 =  face[0][2] - 1
+                vn2 =  face[1][2] - 1
+                vn3 =  face[2][2] - 1
 
                 vertices = [
-                    self.transform(model.vertices[f1], translate, scale),
-                    self.transform(model.vertices[f2], translate, scale),
-                    self.transform(model.vertices[f3], translate, scale),
-                    self.transform(model.vertices[f4], translate, scale)
+                    trans_lineal(objectMatrix, model.vertices[f1]),
+                    trans_lineal(objectMatrix, model.vertices[f2]),
+                    trans_lineal(objectMatrix, model.vertices[f3]),
                 ]
+                texcoords = [
+                    model.texcoords[vt1],
+                    model.texcoords[vt2],
+                    model.texcoords[vt3],
+                ]
+                normals = [
+                    dir_trans_lineal(rotationMatrix, model.normals[vn1]),
+                    dir_trans_lineal(rotationMatrix, model.normals[vn2]),
+                    dir_trans_lineal(rotationMatrix, model.normals[vn3]),
+                ]
+                A = self.camTransfrorm(vertices[0])
+                B = self.camTransfrorm(vertices[1])
+                C = self.camTransfrorm(vertices[2])
+                VTA, VTB, VTC = texcoords
+                VNA, VNB, VNC = normals
+            else:
+                # assuming 4
+                f1 =  face[0][0] - 1
+                f2 =  face[1][0] - 1
+                f3 =  face[2][0] - 1
+                f4 = face[3][0] - 1
 
-                normal = norm(cross(sub(vertices[0], vertices[1]), sub(vertices[1], vertices[2])))  # no necesitamos dos normales!!
-                intensity = dot(normal, light)
-                grey = round(255 * intensity)
-                if grey < 0:
-                    continue 
-        
-                A, B, C, D = vertices 
-                
-                self.triangle(A, B, C, color(grey, grey, grey))
-                self.triangle(A, C, D, color(grey, grey, grey))
+                vt1 =  face[0][1] - 1
+                vt2 =  face[1][1] - 1
+                vt3 =  face[2][1] - 1
+                vt4 =  face[2][1] - 1
+
+                vn1 =  face[0][2] - 1
+                vn2 =  face[1][2] - 1
+                vn3 =  face[2][2] - 1
+                vn4 =  face[2][2] - 1
+
+                vertices = [
+                    trans_lineal(objectMatrix, model.vertices[f1]),
+                    trans_lineal(objectMatrix, model.vertices[f2]),
+                    trans_lineal(objectMatrix, model.vertices[f3]),
+                    trans_lineal(objectMatrix, model.vertices[f4]),
+                ]
+                texcoords = [
+                    model.texcoords[vt1],
+                    model.texcoords[vt2],
+                    model.texcoords[vt3],
+                    model.texcoords[vt4],
+                ]
+                normals = [
+                    dir_trans_lineal(rotationMatrix, model.normals[vn1]),
+                    dir_trans_lineal(rotationMatrix, model.normals[vn2]),
+                    dir_trans_lineal(rotationMatrix, model.normals[vn3]),
+                    dir_trans_lineal(rotationMatrix, model.normals[vn4]),
+                ]
+                A = self.camTransfrorm(vertices[0])
+                B = self.camTransfrorm(vertices[1])
+                C = self.camTransfrorm(vertices[2])
+                D = self.camTransfrorm(vertices[3])
+                VTA, VTB, VTC, VTD = texcoords
+                VNA, VNB, VNC, VND = normals
+
+                self.triangle(A, C, D, (VTA, VTC, VTD), (VNA, VNC, VND), vertices)
+            self.triangle(A, B, C, (VTA, VTB, VTC), (VNA, VNB, VNC), vertices)
 
     def glFinish(self, filename):
         f = open(filename, 'bw')
@@ -245,80 +266,67 @@ class Render(object):
                     j = i
                 if inside:
                     self.point(y,x)
-    def shader(self, x,y,z):
-      if z>245:
-        return color(214,252,255)
-      elif z>244:
-        return color(211,249,252)
-      elif z>243:
-        return color(208,246,249)
-      elif z>240:
-        return color(205,243,246)
-      elif z>235:
-        return color(199,237,240)
-      elif z>230:
-        return color(193,231,234)
-      elif z>220:
-        return color(187,225,228)
-      elif z>210:
-        return color(181,219,222)
-      elif z>200:
-        return color(175,213,216)
-      elif z>190:
-        return color(169,207,210)
-      elif z>180:
-        return color(163,201,204)
-      elif z>170:
-        return color(157,195,198)
-      elif z>160:
-        return color(151,189,192)
-      elif z>150:
-        return color(145,173,176)
-      elif z>140:
-        return color(139,167,170)
-      elif z>130:
-        return color(130,158,161) #9
-      elif z>120:
-        return color(124,152,155)
-      elif z>110:
-        return color(112,140,143)
-      elif z>90:
-        return color(106,134,137)
-      elif z>70:
-        return color(100,128,131)
-      elif z>50:
-        return color(94,122,125)
-      elif z>30:
-        return color(88,116,119)
-      elif z>20:
-        return color(82,110,113)
-      else:
-        return color(76,104,107)
 
-    def triangle(self, A, B, C, color):
-        bbox_min, bbox_max = bbox(A, B, C)
+    def glLookAt(self, eye, camPosition = V3(0, 0, 0)):
+        forward = norm(sub(camPosition, eye))
+        right = norm(cross(V3(0, 1, 0), forward))
+        up = norm(cross(forward, right))
+        
+        self.cameraMatrix = [[right[0], up[0], forward[0], camPosition.x],
+                            [right[1], up[1], forward[1], camPosition.y],
+                            [right[2], up[2], forward[2], camPosition.z],
+                            [0, 0, 0, 1],]
+        self.viewMatrix = inv(self.cameraMatrix)
 
-        for x in range(bbox_min.x, bbox_max.x + 1):
-            for y in range(bbox_min.y, bbox_max.y + 1):
-                w, v, u = barycentric(A, B, C, V2(x, y))
-                if w < 0 or v < 0 or u < 0:  
-                    continue
-                
-                z = A.z * w + B.z * v + C.z * u
-                color = self.shader(x,y,z)
-                if z > self.zbuffer[x][y]:
-                    self.point(x, y,color)
-                    self.zbuffer[x][y] = z
+    def getRotationMatrix(self, rotate):
+        pitch = rotate.x * pi/180
+        yaw = rotate.y * pi/180
+        roll = rotate.z * pi/180
 
-    def transform(self, vertex, translate=(0, 0, 0), scale=(1, 1, 1)):
+        rotationX = [[1, 0, 0, 0],
+                    [0, cos(pitch), -sin(pitch), 0],
+                    [0, sin(pitch), cos(pitch), 0],
+                    [0, 0, 0, 1],]
+
+        rotationY = [[cos(yaw), 0, sin(yaw), 0],
+                    [0, 1, 0, 0],
+                    [-sin(yaw), 0, cos(yaw), 0],
+                    [0, 0, 0, 1],]
+
+        rotationZ = [[cos(roll), -sin(roll), 0, 0],
+                    [sin(roll), cos(roll), 0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],]
+
+        return matrixmul(rotationX, matrixmul(rotationY, rotationZ))
+
+    def getObjectMatrix(self, translate = V3(0,0,0), scale = V3(1,1,1), rotate = V3(0,0,0)):
+        translateMatrix = [[1, 0, 0, translate.x],
+                            [0, 1, 0, translate.y],
+                            [0, 0, 1, translate.z],
+                            [0, 0, 0, 1],]
+        scaleMatrix = [[scale.x, 0, 0, 0],
+                        [0, scale.y, 0, 0],
+                        [0, 0, scale.z, 0],
+                        [0, 0, 0, 1],]
+
+        rotationMatrix = self.getRotationMatrix(rotate)
+
+        return matrixmul(translateMatrix, matrixmul(rotationMatrix, scaleMatrix))
+
+    def camTransfrorm(self, v):
+        v2 = [v[0], v[1], v[2], 1]
+        v2 = trans_lineal(self.viewMatrix, v2)
+        v2 = trans_lineal(self.projectionMatrix, v2)
+        v2 = trans_lineal(self.viewPortMatrix, v2)
+        return V3(v2[0], v2[1], v2[2])
     
-        return V3(
-        round((vertex[0] + translate[0]) * scale[0]),
-        round((vertex[1] + translate[1]) * scale[1]),
-        round((vertex[2] + translate[2]) * scale[2])
-        )
 
 r = Render()
-r.glCreateWindow(1000,1000)
-r.load('./sphere.obj', (1, 1, 0), (500, 500, 500))
+r.activeTexture = texture('modelos/model.bmp')
+r.shader = bars
+r.glLookAt(V3(0, 0, -500))
+r.light = V3(0, 0, -1)
+r.glCreateWindow(500, 500)
+r.load('modelos/model.obj', V3(0, 0, -500), V3(150, 150, 150), V3(0, 0, 0))
 r.glFinish('out.bmp')
